@@ -55,7 +55,7 @@ struct PhotosAlbum: Identifiable, Equatable {
 struct PhotosAlbumSummary: Identifiable, Equatable {
     let album: PhotosAlbum
     let count: Int
-    let keyAssetIdentifier: String?
+    let keyAsset: PHAsset?
 
     var id: String { album.id }
 }

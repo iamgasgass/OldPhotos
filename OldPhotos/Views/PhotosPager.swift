@@ -103,8 +103,16 @@ final class PhotosViewerModel: NSObject, ObservableObject, UIPageViewControllerD
         didShow(page)
     }
 
+    private var cachedNeighbours: [PHAsset] = []
+
     private func didShow(_ page: PhotosPageController) {
         index = page.index
+        let neighbours = [page.index - 1, page.index + 1, page.index + 2]
+            .filter { $0 >= 0 && $0 < assets.count }
+            .map { assets.object(at: $0) }
+        PhotosImages.stopCaching(cachedNeighbours.filter { !neighbours.contains($0) })
+        PhotosImages.startCaching(neighbours)
+        cachedNeighbours = neighbours
         currentIsVideo = page.asset.mediaType == .video
         if !slideshow {
             isPlaying = false
@@ -205,6 +213,8 @@ final class PhotosViewerModel: NSObject, ObservableObject, UIPageViewControllerD
     }
 
     func teardown() {
+        PhotosImages.stopCaching(cachedNeighbours)
+        cachedNeighbours = []
         stopSlideshow()
         currentPage?.stopPlayback()
     }
@@ -227,6 +237,8 @@ final class PhotosPageController: UIViewController, UIScrollViewDelegate {
     private var endObserver: NSObjectProtocol?
     private var requestID: PHImageRequestID?
     private var loadedSize: CGSize = .zero
+    private var loadedDetail = false
+    private var detailRequestID: PHImageRequestID?
     private var requestingPlayer = false
 
     init(asset: PHAsset, index: Int) {
@@ -241,7 +253,8 @@ final class PhotosPageController: UIViewController, UIScrollViewDelegate {
 
     deinit {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        if let requestID { PHImageManager.default().cancelImageRequest(requestID) }
+        if let requestID { PhotosImages.cancel(requestID) }
+        if let detailRequestID { PHImageManager.default().cancelImageRequest(detailRequestID) }
     }
 
     private var isVideo: Bool { asset.mediaType == .video }
@@ -301,23 +314,39 @@ final class PhotosPageController: UIViewController, UIScrollViewDelegate {
 
     // MARK: Image
 
+    /// Screen-size first (fast while swiping); the full-detail image is
+    /// loaded only when the photo is zoomed.
     private func loadImage() {
-        let scale = UIScreen.main.scale
-        var target = CGSize(width: view.bounds.width * scale * 2.5, height: view.bounds.height * scale * 2.5)
-        target.width = min(target.width, CGFloat(asset.pixelWidth))
-        target.height = min(target.height, CGFloat(asset.pixelHeight))
-        if target.width <= 0 || target.height <= 0 {
-            target = CGSize(width: view.bounds.width * scale, height: view.bounds.height * scale)
-        }
-        if let requestID { PHImageManager.default().cancelImageRequest(requestID) }
-        requestID = PhotosImages.image(for: asset, fitting: target) { [weak self] image, _ in
-            guard let self, let image else { return }
+        if let requestID { PHImageManager.default().cancelImageRequest(requestID); PhotosImages.cancel(requestID) }
+        requestID = PhotosImages.screenImage(for: asset) { [weak self] image, _ in
+            guard let self, let image, !self.loadedDetail else { return }
             let first = self.imageView.image == nil
             self.imageView.image = image
             if first || self.scrollView.zoomScale == 1 {
                 self.layoutImage()
             }
         }
+    }
+
+    private func loadDetail() {
+        guard !isVideo, !loadedDetail else { return }
+        loadedDetail = true
+        let scale = UIScreen.main.scale
+        var target = CGSize(width: view.bounds.width * scale * 3, height: view.bounds.height * scale * 3)
+        target.width = min(target.width, CGFloat(asset.pixelWidth))
+        target.height = min(target.height, CGFloat(asset.pixelHeight))
+        guard target.width > 0, target.height > 0 else { return }
+        detailRequestID = PhotosImages.image(for: asset, fitting: target) { [weak self] image, _ in
+            guard let self, let image else { return }
+            self.imageView.image = image
+            if self.scrollView.zoomScale == 1 {
+                self.layoutImage()
+            }
+        }
+    }
+
+    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        loadDetail()
     }
 
     /// Fits the photo in the page at its normal size and centres it.
@@ -366,6 +395,7 @@ final class PhotosPageController: UIViewController, UIScrollViewDelegate {
         if scrollView.zoomScale > 1.01 {
             scrollView.setZoomScale(1, animated: true)
         } else {
+            loadDetail()
             let point = gesture.location(in: imageView)
             let scale = min(2.5, scrollView.maximumZoomScale)
             let size = CGSize(width: scrollView.bounds.width / scale, height: scrollView.bounds.height / scale)

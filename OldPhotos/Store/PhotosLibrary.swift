@@ -77,27 +77,41 @@ final class PhotosLibrary: NSObject, ObservableObject, PHPhotoLibraryChangeObser
         generation += 1
         let current = generation
 
+        // Roll, counts and albums first (what the screens need right away),
+        // then the Places pins, which read every asset's location.
         queue.async { [weak self] in
             let roll = PhotosAlbum.cameraRoll.fetchAssets()
             let photos = roll.countOfAssets(with: .image)
             let videos = roll.countOfAssets(with: .video)
             let albums = Self.fetchAlbums()
-            let places = Self.makePlaces(roll)
             DispatchQueue.main.async {
                 guard let self, current == self.generation else { return }
                 self.cameraRoll = roll
                 self.photoCount = photos
                 self.videoCount = videos
-                self.albums = albums
-                self.places = places
+                if self.albums != albums { self.albums = albums }
                 self.isLoaded = true
                 self.revision += 1
+            }
+            let places = Self.makePlaces(roll)
+            DispatchQueue.main.async {
+                guard let self, current == self.generation else { return }
+                if self.places != places { self.places = places }
             }
         }
     }
 
+    private var pendingChange: DispatchWorkItem?
+
+    /// Bursts of changes (a shot being processed, iCloud syncing) are
+    /// coalesced into one reload.
     func photoLibraryDidChange(_ changeInstance: PHChange) {
-        DispatchQueue.main.async { self.reload() }
+        DispatchQueue.main.async {
+            self.pendingChange?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.reload() }
+            self.pendingChange = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        }
     }
 
     /// The device albums (iOS 6 listed them under Camera Roll).
@@ -119,7 +133,7 @@ final class PhotosLibrary: NSObject, ObservableObject, PHPhotoLibraryChangeObser
                 title: collection.localizedTitle ?? "Album",
                 kind: .collection(localIdentifier: collection.localIdentifier)
             )
-            result.append(PhotosAlbumSummary(album: album, count: assets.count, keyAssetIdentifier: assets.lastObject?.localIdentifier))
+            result.append(PhotosAlbumSummary(album: album, count: assets.count, keyAsset: assets.lastObject))
         }
 
         // Favorites, then the user's albums and shared albums.
@@ -202,10 +216,37 @@ enum PhotosImages {
         }
     }
 
+    /// Screen-size options, shared by the viewer requests and the
+    /// neighbour pre-caching so the cache is actually hit.
+    static let screenOptions: PHImageRequestOptions = {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        return options
+    }()
+
+    /// The viewer's page size in pixels.
+    static var screenTarget: CGSize {
+        let bounds = UIScreen.main.bounds.size
+        let scale = UIScreen.main.scale
+        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+
+    /// Screen-size image for a page (cached, pre-fetched for neighbours).
+    @discardableResult
+    static func screenImage(for asset: PHAsset, completion: @escaping (UIImage?, Bool) -> Void) -> PHImageRequestID {
+        manager.requestImage(for: asset, targetSize: screenTarget, contentMode: .aspectFit, options: screenOptions) { image, info in
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            completion(image, degraded)
+        }
+    }
+
+    /// Full-detail image, requested only once the photo is zoomed.
     @discardableResult
     static func image(for asset: PHAsset, fitting size: CGSize, completion: @escaping (UIImage?, Bool) -> Void) -> PHImageRequestID {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .opportunistic
+        options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
         return PHImageManager.default().requestImage(
@@ -217,6 +258,16 @@ enum PhotosImages {
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             completion(image, degraded)
         }
+    }
+
+    static func startCaching(_ assets: [PHAsset]) {
+        guard !assets.isEmpty else { return }
+        manager.startCachingImages(for: assets, targetSize: screenTarget, contentMode: .aspectFit, options: screenOptions)
+    }
+
+    static func stopCaching(_ assets: [PHAsset]) {
+        guard !assets.isEmpty else { return }
+        manager.stopCachingImages(for: assets, targetSize: screenTarget, contentMode: .aspectFit, options: screenOptions)
     }
 
     static func cancel(_ id: PHImageRequestID) {

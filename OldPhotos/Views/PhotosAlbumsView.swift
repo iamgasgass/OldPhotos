@@ -37,7 +37,7 @@ struct PhotosAlbumsView: View {
                             PhotosAlbumRow(
                                 title: summary.album.title,
                                 count: summary.count,
-                                keyAsset: summary.keyAssetIdentifier.flatMap { library.asset(withIdentifier: $0) }
+                                keyAsset: summary.keyAsset
                             ) {
                                 navigator.open(summary.album)
                             }
